@@ -1,0 +1,22 @@
+# Core
+kagglehub[pandas-datasets]
+pandas>=2.0
+numpy>=1.24
+
+# Apache Spark
+pyspark==3.5.0
+
+# Kafka
+confluent-kafka>=2.3.0
+
+# PostgreSQL
+psycopg2-binary>=2.9
+
+# Dashboard
+streamlit>=1.32
+streamlit-autorefresh>=1.0
+plotly>=5.18
+
+# DataOps / utilities
+python-dotenv>=1.0
+loguru>=0.7
