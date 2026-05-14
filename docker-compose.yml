@@ -1,0 +1,210 @@
+# ─────────────────────────────────────────────────────────────────────
+# Hybrid Data Engineering Pipeline — local dev stack.
+#
+#   Infrastructure containers (always running):
+#     zookeeper, kafka, postgres, spark-master, spark-worker
+#
+#   Application containers (start the ones you need):
+#     app        — generic shell to run one-shot scripts (load_dataset,
+#                  spark_batch, ad-hoc psql, etc). Stays alive idle.
+#     producer   — runs streaming/kafka_producer.py
+#     streamer   — runs streaming/spark_streaming.py
+#     dashboard  — runs streamlit on http://localhost:8501
+#
+# Quick start:
+#   docker compose up -d zookeeper kafka postgres
+#   docker compose run --rm app python ingestion/load_dataset.py
+#   docker compose run --rm app python batch/spark_batch.py
+#   docker compose up -d producer streamer dashboard
+#
+# See DOCKER_SETUP.md for the full walkthrough.
+# ─────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Zookeeper ────────────────────────────────────────────────────
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    container_name: hdep-zookeeper
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/bitnami/zookeeper
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Kafka 3.9 (Zookeeper mode, matches SETUP_GUIDE.docx pin) ─────
+  # Two listeners:
+  #   PLAINTEXT  : 29092 — used by other containers on the docker net
+  #   EXTERNAL   :  9092 — published to the host so host code (eg. the
+  #                        venv on the user's Windows machine) can also
+  #                        connect via localhost:9092
+  kafka:
+    image: bitnami/kafka:3.9
+    container_name: hdep-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_CFG_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:29092,EXTERNAL://:9092"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    volumes:
+      - kafka_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:29092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  # ── Kafka topic bootstrap (creates sales_topic once Kafka is up) ─
+  kafka-init:
+    image: bitnami/kafka:3.9
+    container_name: hdep-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists \
+          --topic sales_topic \
+          --partitions 1 --replication-factor 1
+        echo "Topic 'sales_topic' ready."
+
+  # ── PostgreSQL 16 ────────────────────────────────────────────────
+  # On first launch the postgres image runs every .sql in
+  # /docker-entrypoint-initdb.d/, so create_tables.sql is applied
+  # automatically to the new ecommerce_pipeline database.
+  postgres:
+    image: postgres:16
+    container_name: hdep-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: murtazamuhammad7
+      POSTGRES_DB: ecommerce_pipeline
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/create_tables.sql:/docker-entrypoint-initdb.d/01_create_tables.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ecommerce_pipeline"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ── Spark master + worker ────────────────────────────────────────
+  # Available at spark://spark-master:7077 inside the docker network.
+  # The Python code defaults to SPARK_MASTER=local[*] (in-process) and
+  # the cluster is optional; flip via the SPARK_MASTER env var on the
+  # app/producer/streamer/dashboard services to use the cluster.
+  spark-master:
+    image: bitnami/spark:3.5
+    container_name: hdep-spark-master
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+      SPARK_SSL_ENABLED: "no"
+    ports:
+      - "7077:7077"   # Spark master RPC
+      - "8080:8080"   # Spark master web UI
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    container_name: hdep-spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: "spark://spark-master:7077"
+      SPARK_WORKER_MEMORY: "2G"
+      SPARK_WORKER_CORES: "2"
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+      SPARK_SSL_ENABLED: "no"
+
+  # ── Application image ───────────────────────────────────────────
+  # All four Python services share the same build (Dockerfile) and
+  # the same environment block; they only differ in `command:`.
+  # Code lives on the host and is bind-mounted into /workspace so
+  # edits don't need a rebuild.
+  app: &app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hdep-app:latest
+    container_name: hdep-app
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      # Settings.py reads these — values target docker-network DNS, not
+      # localhost, so the in-container apps reach the right services.
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ecommerce_pipeline
+      DB_USER: postgres
+      DB_PASSWORD: murtazamuhammad7
+      KAFKA_BOOTSTRAP: kafka:29092
+      KAFKA_TOPIC: sales_topic
+      SPARK_MASTER: "local[*]"
+      JDBC_JAR_PATH: /opt/jars/postgresql-42.7.3.jar
+      STREAM_CHECKPOINT: /workspace/.spark_checkpoint
+      # Fix for the "getSubject is not supported" warning under Java 17.
+      SPARK_SUBMIT_OPTS: "--add-opens=java.base/javax.security.auth=ALL-UNNAMED"
+    volumes:
+      - ./:/workspace
+      # Mount the user's Kaggle credentials (read-only) so
+      # ingestion/load_dataset.py can pull the dataset.
+      # Override KAGGLE_DIR in a .env if your kaggle.json lives elsewhere.
+      - ${KAGGLE_DIR:-~/.kaggle}:/root/.kaggle:ro
+    working_dir: /workspace
+    # Idle by default — use `docker compose run --rm app <cmd>` to run
+    # one-shot scripts, or `docker compose exec app bash` for a shell.
+    command: ["tail", "-f", "/dev/null"]
+
+  producer:
+    <<: *app
+    container_name: hdep-producer
+    command: ["python", "streaming/kafka_producer.py"]
+
+  streamer:
+    <<: *app
+    container_name: hdep-streamer
+    command: ["python", "streaming/spark_streaming.py"]
+
+  dashboard:
+    <<: *app
+    container_name: hdep-dashboard
+    ports:
+      - "8501:8501"
+    command:
+      - "streamlit"
+      - "run"
+      - "dashboard/app.py"
+      - "--server.address=0.0.0.0"
+      - "--server.port=8501"
+
+volumes:
+  zookeeper_data:
+  kafka_data:
+  postgres_data:

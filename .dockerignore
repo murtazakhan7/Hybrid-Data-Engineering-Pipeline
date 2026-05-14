@@ -1,0 +1,32 @@
+# Keep the build context small and reproducible.
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Local data and Spark scratch
+data/
+.spark_checkpoint/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Claude worktrees (these don't belong in the image)
+.claude/
+
+# Docker artifacts themselves
+docker-compose.yml
+Dockerfile
+.dockerignore
