@@ -2,7 +2,7 @@
 # Hybrid Data Engineering Pipeline — local dev stack.
 #
 #   Infrastructure containers (always running):
-#     zookeeper, kafka, postgres, spark-master, spark-worker
+#     kafka, postgres, spark-master, spark-worker
 #
 #   Application containers (start the ones you need):
 #     app        — generic shell to run one-shot scripts (load_dataset,
@@ -12,65 +12,57 @@
 #     dashboard  — runs streamlit on http://localhost:8501
 #
 # Quick start:
-#   docker compose up -d zookeeper kafka postgres
+#   docker compose up -d kafka postgres
 #   docker compose run --rm app python ingestion/load_dataset.py
 #   docker compose run --rm app python batch/spark_batch.py
 #   docker compose up -d producer streamer dashboard
 #
 # See DOCKER_SETUP.md for the full walkthrough.
+#
+# NOTE: Zookeeper removed. Kafka now runs in KRaft mode (self-managed
+# metadata, no external coordinator needed) via apache/kafka:3.7.0.
 # ─────────────────────────────────────────────────────────────────────
 
 services:
 
-  # ── Zookeeper ────────────────────────────────────────────────────
-  zookeeper:
-    image: bitnami/zookeeper:3.9
-    container_name: hdep-zookeeper
-    environment:
-      ALLOW_ANONYMOUS_LOGIN: "yes"
-    ports:
-      - "2181:2181"
-    volumes:
-      - zookeeper_data:/bitnami/zookeeper
-    healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  # ── Kafka 3.9 (Zookeeper mode, matches SETUP_GUIDE.docx pin) ─────
+  # ── Kafka 3.7.0 (KRaft mode — no Zookeeper required) ─────────────
   # Two listeners:
   #   PLAINTEXT  : 29092 — used by other containers on the docker net
-  #   EXTERNAL   :  9092 — published to the host so host code (eg. the
-  #                        venv on the user's Windows machine) can also
-  #                        connect via localhost:9092
+  #   EXTERNAL   :  9092 — published to the host so host code (e.g.
+  #                        a venv on the user's Windows machine) can
+  #                        also connect via localhost:9092
   kafka:
-    image: bitnami/kafka:3.9
+    image: apache/kafka:3.7.0
     container_name: hdep-kafka
-    depends_on:
-      zookeeper:
-        condition: service_healthy
     ports:
       - "9092:9092"
     environment:
-      KAFKA_CFG_ZOOKEEPER_CONNECT: "zookeeper:2181"
-      KAFKA_CFG_LISTENERS: "PLAINTEXT://:29092,EXTERNAL://:9092"
-      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092"
-      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT"
-      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
-      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
-      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Fixed cluster ID — must be a valid base64-encoded 16-byte UUID.
+      # Generate a fresh one with: kafka-storage.sh random-uuid
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
     volumes:
-      - kafka_data:/bitnami/kafka
+      - kafka_data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:29092 --list >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list >/dev/null 2>&1"]
       interval: 10s
       timeout: 5s
       retries: 15
 
   # ── Kafka topic bootstrap (creates sales_topic once Kafka is up) ─
   kafka-init:
-    image: bitnami/kafka:3.9
+    image: apache/kafka:3.7.0
     container_name: hdep-kafka-init
     depends_on:
       kafka:
@@ -79,7 +71,7 @@ services:
     entrypoint: ["bash", "-c"]
     command:
       - |
-        kafka-topics.sh --bootstrap-server kafka:29092 \
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
           --create --if-not-exists \
           --topic sales_topic \
           --partitions 1 --replication-factor 1
@@ -205,6 +197,5 @@ services:
       - "--server.port=8501"
 
 volumes:
-  zookeeper_data:
   kafka_data:
   postgres_data:

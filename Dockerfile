@@ -3,7 +3,7 @@
 # Bundles Java 17 (Temurin) + Python 3.11 + project requirements
 # + the PostgreSQL JDBC driver Spark needs to talk to Postgres.
 # ─────────────────────────────────────────────────────────────
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
